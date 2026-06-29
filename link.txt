@@ -1,0 +1,32 @@
+{
+  "vivaanuncios": [
+    "https://www.vivanuncios.com.mx/s-renta-locales-comerciales/nuevo-leon/v1c1276l1018p1",
+    "https://www.vivanuncios.com.mx/s-venta-locales-comerciales/nuevo-leon/v1c1112l1018p1",
+    "https://www.vivanuncios.com.mx/s-venta-terrenos/nuevo-leon/v1c31l1018p1",
+    "https://www.vivanuncios.com.mx/s-renta-terrenos/nuevo-leon/v1c1292l1018p1"
+  ],
+  "inmuebles24": [
+    "https://www.inmuebles24.com/locales-comerciales-en-renta-en-nuevo-leon.html",
+    "https://www.inmuebles24.com/locales-comerciales-en-venta-en-nuevo-leon.html",
+    "https://www.inmuebles24.com/terrenos-en-venta-en-nuevo-leon.html"
+
+  ],
+  "lamudi": [
+    "https://www.lamudi.com.mx/nuevo-leon/comercial/for-sale/",
+    "https://www.lamudi.com.mx/nuevo-leon/comercial/for-rent/",
+    "https://www.lamudi.com.mx/nuevo-leon/terreno/for-sale/"
+  ],
+  "propiedadesmx": [
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-monterrey_nuevo_leon",
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-san_pedro_garza_garcia_nuevo_leon",
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-san_nicolas_de_los_garza_nuevo_leon",
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-general_escobedo_nuevo_leon",
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-apodaca_nuevo_leon",
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-garcia_nuevo_leon",
+    "https://www.propiedadesmexico.com/Es/propiedades-en-venta-en-guadalupe_nuevo_leon"
+  ],
+  "century21": [
+    "https://century21mexico.com/v/resultados/en-pais_mexico/en-estado_nuevo-leon/en-municipio_monterrey/tipo_local/operacion_renta",
+    "https://century21mexico.com/v/resultados/tipo_local/operacion_renta/en-pais_mexico/en-estado_nuevo-leon"
+  ]
+}

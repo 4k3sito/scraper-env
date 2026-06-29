@@ -11,7 +11,6 @@ __pycache__/
 # Output and logs
 output/
 error_logs/
-*.csv
 
 # IDE
 .vscode/
@@ -24,3 +23,6 @@ Thumbs.db
 # Agents config (local)
 .agents/
 skills-lock.json
+
+# Profile data (browser sessions)
+profiles/
