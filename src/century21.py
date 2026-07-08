@@ -20,7 +20,7 @@ from crawlee.storage_clients import MemoryStorageClient
 from scrapling.parser import Selector
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint
 from src.parser import parse_description, merge_parsed
-from src.proxy import res_proxy_url as _res_proxy_url
+from src.proxy import res_tier
 
 
 ORIGIN = "https://century21mexico.com"
@@ -96,7 +96,7 @@ async def collect_urls_for(search_url: str) -> list[dict]:
     # RESIDENTIAL en ambas fases: verificado que el Cloudflare de este sitio
     # corta el tunel con IPs datacenter (ERR_TUNNEL_CONNECTION_FAILED), pero
     # pasa limpio con residencial.
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
@@ -254,7 +254,7 @@ async def extract_details(listings: list[dict]) -> list[dict]:
     """Entra a cada listing {id, url} y devuelve records extraidos."""
     results = []
 
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),

@@ -15,7 +15,7 @@ from crawlee.storage_clients import MemoryStorageClient
 from scrapling.parser import Selector
 from src.utils import atomic_write_json, setup_graceful_shutdown, setup_log, Checkpoint
 from src.parser import parse_description, merge_parsed
-from src.proxy import dc_proxy_url as _dc_proxy_url, res_proxy_url as _res_proxy_url
+from src.proxy import dc_tier, res_tier
 
 
 BASE = "https://www.lamudi.com.mx/nuevo-leon/monterrey/comercial/venta-al-por-menor/for-sale/"
@@ -141,7 +141,10 @@ async def collect_urls_for(base_url: str) -> list[dict]:
     state = {"empty_streak": 0}
     page_iter = tqdm(total=MAX_PAGES, desc="  Collecting pages", unit="pg", leave=False)
 
-    proxy_config = ProxyConfiguration(new_url_function=_dc_proxy_url)
+    # Tiered: intenta datacenter primero (barato), escala a residencial solo
+    # si Crawlee detecta bloqueo — asi no hace falta apagar dc a mano si se
+    # quema a mitad de corrida (le paso a Pincali con el grupo datacenter).
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[dc_tier(), res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
@@ -291,7 +294,7 @@ async def extract_details(listings: list[dict]) -> list[dict]:
     """Entra a cada listing {id, url, lat, lng} y devuelve records extraidos."""
     results = []
 
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),

@@ -31,7 +31,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapling.parser import Selector
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint
 from src.parser import parse_description, merge_parsed
-from src.proxy import res_proxy_url as _res_proxy_url
+from src.proxy import res_tier
 
 
 # ── Phase 1 checkpoint ──────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ async def collect_listing_urls(search_url: str) -> list[str]:
     # devolver 405 de forma consistente hoy tras uso intensivo — probable IP
     # quemada, no flakiness transitoria. Mismo patron que Century21/Vivanuncios/
     # Inmuebles24.
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
@@ -319,7 +319,7 @@ async def extract_listing(urls: list[str]) -> list[dict]:
     """
     results = []
 
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),

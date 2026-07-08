@@ -11,11 +11,14 @@ different .env key for those. Optional: APIFY_PROXY_GROUPS (default "auto"),
 APIFY_PROXY_COUNTRY.
 
 Usage:
-    from src.proxy import ApifyProxyConfig
+    from src.proxy import ApifyProxyConfig, dc_tier, res_tier
 
     proxy = ApifyProxyConfig(groups="RESIDENTIAL")
-    dc_proxy = ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER")
     driver.get(url)  # or pass proxy.url() straight to @browser(proxy=...)
+
+    # Crawlee scrapers: feed dc_tier()/res_tier() to tiered_proxy_urls so
+    # Crawlee starts on the cheapest tier and only escalates on a block.
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[dc_tier(), res_tier()])
 """
 import os
 import random
@@ -65,14 +68,26 @@ def _group_proxy(groups: str) -> "ApifyProxyConfig":
     return ApifyProxyConfig(groups=groups)
 
 
-# Crawlee's ProxyConfiguration calls new_url_function(session_id, request) —
-# no third arg, so these take exactly what Crawlee passes.
-async def dc_proxy_url(session_id=None, request=None):
-    return _group_proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
+# Crawlee's tiered_proxy_urls wants a static list[list[str]], not a function:
+# it round-robins each Crawlee session_id onto one URL from the list and reuses
+# it for that session's retries, escalating to the next tier only when a
+# session gets marked blocked. To keep the old "one Apify session per Crawlee
+# session" IP-pinning, each URL in the pool bakes in its own distinct
+# session-<id> — a plain group URL with no session would let Apify's gateway
+# swap IPs on every request through it, defeating that pinning.
+POOL_SIZE = 200  # just strings, no cost — bigger than realistic concurrency
 
 
-async def res_proxy_url(session_id=None, request=None):
-    return _group_proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+def _pool(config: ApifyProxyConfig, size: int) -> list[str]:
+    return [config.url(session=ApifyProxyConfig.new_session_id()) for _ in range(size)]
+
+
+def dc_tier(size: int = POOL_SIZE) -> list[str]:
+    return _pool(_group_proxy("auto"), size)
+
+
+def res_tier(size: int = POOL_SIZE) -> list[str]:
+    return _pool(_group_proxy("RESIDENTIAL"), size)
 
 
 def _selftest():
@@ -95,6 +110,11 @@ def _selftest():
 
     s1, s2 = ApifyProxyConfig.new_session_id(), ApifyProxyConfig.new_session_id()
     assert s1 != s2, "session ids must be unique per call"
+
+    tier = res_tier(size=5)
+    assert len(tier) == 5
+    assert len(set(tier)) == 5, "each pool slot must pin a distinct Apify session"
+    assert all("groups-RESIDENTIAL" in u and "session-" in u for u in tier)
 
     print("ok")
 

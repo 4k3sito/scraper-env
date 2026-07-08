@@ -39,7 +39,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapling.parser import Selector
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint
 from src.parser import parse_description, merge_parsed
-from src.proxy import dc_proxy_url as _dc_proxy_url, res_proxy_url as _res_proxy_url
+from src.proxy import dc_tier, res_tier
 
 
 pbar = None
@@ -343,7 +343,10 @@ async def collect_listing_urls(search_url: str, max_pages: int | None = None) ->
     cap = min(max_pages or MAX_PAGES, MAX_PAGES)
     page_iter = tqdm(total=cap, desc="  Collecting pages", unit="pg", leave=False)
 
-    proxy_config = ProxyConfiguration(new_url_function=_dc_proxy_url)
+    # Tiered: intenta datacenter primero (barato), escala a residencial solo
+    # si Crawlee detecta bloqueo — asi no hace falta apagar dc a mano si se
+    # quema a mitad de corrida (le paso a Pincali con el grupo datacenter).
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[dc_tier(), res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
@@ -410,7 +413,7 @@ async def extract_listings(urls: list[str]) -> list[dict]:
     """Entra a cada URL y devuelve la lista de records extraidos."""
     results = []
 
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),

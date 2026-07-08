@@ -21,7 +21,7 @@ from scrapling.parser import Selector
 from dotenv import load_dotenv
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint, setup_log
 from src.parser import parse_description, merge_parsed
-from src.proxy import res_proxy_url as _res_proxy_url
+from src.proxy import res_tier
 
 
 load_dotenv()
@@ -322,7 +322,7 @@ async def collect_ad_urls(search_url: str, max_pages: int | None = None) -> list
     # Residencial en las dos fases: verificado que este sitio devuelve 403
     # (bloqueo) con el proxy datacenter incluso para la busqueda (Fase 1),
     # mismo patron que Century21 e Inmuebles24.
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
@@ -384,7 +384,7 @@ async def collect_ad_urls(search_url: str, max_pages: int | None = None) -> list
 async def extract_one(urls: list[str]) -> list[dict]:
     results = []
 
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),

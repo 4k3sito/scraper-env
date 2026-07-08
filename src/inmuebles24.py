@@ -25,7 +25,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapling.parser import Selector
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint, setup_log
 from src.parser import parse_description, merge_parsed
-from src.proxy import res_proxy_url as _res_proxy_url
+from src.proxy import res_tier
 
 
 ORIGIN = "https://www.inmuebles24.com"
@@ -172,7 +172,7 @@ async def collect_urls_for(search_url: str) -> list[dict]:
     # Residencial en las dos fases: verificado que este sitio devuelve 403
     # (bloqueo) con el proxy datacenter incluso para la busqueda (Fase 1),
     # a diferencia de Pincali/PropiedadesMX donde datacenter si funciona.
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
@@ -313,7 +313,7 @@ async def extract_details(listings: list[dict]) -> list[dict]:
     """Entra a cada listing {id, url} y devuelve la lista de records extraidos."""
     results = []
 
-    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
         storage_client=MemoryStorageClient(),
