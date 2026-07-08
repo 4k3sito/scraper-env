@@ -20,6 +20,7 @@ Usage:
 import os
 import random
 import string
+from functools import lru_cache
 
 from dotenv import load_dotenv
 
@@ -53,6 +54,25 @@ class ApifyProxyConfig:
     def new_session_id() -> str:
         """Random session id -> forces a fresh IP on the next call to .url()."""
         return "s" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+
+
+@lru_cache(maxsize=None)
+def _group_proxy(groups: str) -> "ApifyProxyConfig":
+    # "auto" -> dedicated datacenter group, own password (bought separately,
+    # not covered by APIFY_PROXY_PASSWORD).
+    if groups == "auto":
+        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
+    return ApifyProxyConfig(groups=groups)
+
+
+# Crawlee's ProxyConfiguration calls new_url_function(session_id, request) —
+# no third arg, so these take exactly what Crawlee passes.
+async def dc_proxy_url(session_id=None, request=None):
+    return _group_proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
+
+
+async def res_proxy_url(session_id=None, request=None):
+    return _group_proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
 
 
 def _selftest():

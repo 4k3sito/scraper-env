@@ -20,7 +20,6 @@ import os, sys
 import json
 import re
 from datetime import timedelta
-from functools import lru_cache
 from urllib.parse import urljoin
 
 from tqdm import tqdm
@@ -32,26 +31,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapling.parser import Selector
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint
 from src.parser import parse_description, merge_parsed
-from src.proxy import ApifyProxyConfig
-
-# ponytail: datacenter para paginar (barato), residencial para el detalle
-# (donde pega mas fuerte el bloqueo). Lazy: solo exige APIFY_PROXY_PASSWORD
-# cuando el scraper corre de verdad, no al importar el modulo.
-@lru_cache(maxsize=None)
-def _proxy(groups):
-    # "auto" -> grupo datacenter dedicado, con password propia (grupo comprado
-    # aparte, no cubierto por APIFY_PROXY_PASSWORD general).
-    if groups == "auto":
-        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
-    return ApifyProxyConfig(groups=groups)
-
-
-async def _dc_proxy_url(session_id=None, request=None, proxy_tier=None):
-    return _proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
-
-
-async def _res_proxy_url(session_id=None, request=None, proxy_tier=None):
-    return _proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+from src.proxy import res_proxy_url as _res_proxy_url
 
 
 # ── Phase 1 checkpoint ──────────────────────────────────────────────────────
