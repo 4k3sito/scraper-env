@@ -113,7 +113,7 @@ def prepare_address(location_raw):
 
 def fetch_missing(conn, source=None, limit=None):
     """Return list of dicts: {id, external_id, source, location, url}."""
-    clauses = ["lat IS NULL"]
+    clauses = ["lat IS NULL", "is_active = true"]
     params = []
     if source:
         clauses.append("source = %s")
@@ -145,7 +145,7 @@ def update_coords(conn, row_id, lat, lon):
 
 
 def count_missing(conn, source=None):
-    clauses = ["lat IS NULL"]
+    clauses = ["lat IS NULL", "is_active = true"]
     params = []
     if source:
         clauses.append("source = %s")

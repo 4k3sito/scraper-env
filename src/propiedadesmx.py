@@ -1,6 +1,7 @@
 """
 Scraper robusto para propiedadesmexico.com
-Motor principal: Botasaurus
+Motor principal: Crawlee (PlaywrightCrawler — driver, proxy, sesiones,
+reintentos y deteccion de bloqueo nativa) + Scrapling (parser).
 
 FASE 1: recolecta las URLs de todos los listings paginando por ?page=N
         (robusto para cualquier busqueda/filtro de la web).
@@ -15,28 +16,51 @@ Las imagenes se toman del carrusel renderizado (DOM) porque el array
 'images' del SSR a veces viene incompleto; se combina con el SSR y se
 valida contra el contador del carrusel para garantizar que esten TODAS.
 
-Requisitos:
-    pip install botasaurus
-
 Uso:
     python -m src.propiedadesmx
     (edita SEARCH al final con la URL de busqueda que quieras)
 """
 
+import asyncio
 import os, json
 import math
 import re
-import time
-import random
+from datetime import timedelta
+from functools import lru_cache
 from urllib.parse import (
     urljoin, urlparse, parse_qs, urlencode, urlunparse, unquote,
 )
 from tqdm import tqdm
 
-from botasaurus.browser import browser, Driver
+from crawlee import Request
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.proxy_configuration import ProxyConfiguration
+from crawlee.storage_clients import MemoryStorageClient
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapling.parser import Selector
-from src.utils import atomic_write_json, setup_graceful_shutdown, should_stop, Checkpoint, setup_log
+from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint
 from src.parser import parse_description, merge_parsed
+from src.proxy import ApifyProxyConfig
+
+# ponytail: datacenter para paginar (barato), residencial para el detalle
+# (donde el sitio bloquea mas fuerte). Lazy: solo exige APIFY_PROXY_PASSWORD
+# al correr de verdad, no al importar el modulo.
+@lru_cache(maxsize=None)
+def _proxy(groups):
+    # "auto" -> grupo datacenter dedicado, con password propia (grupo comprado
+    # aparte, no cubierto por APIFY_PROXY_PASSWORD general).
+    if groups == "auto":
+        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
+    return ApifyProxyConfig(groups=groups)
+
+
+async def _dc_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
+
+
+async def _res_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+
 
 pbar = None
 
@@ -49,6 +73,7 @@ _cp_checkpoint = None
 # ==========================================================================
 BASE = "https://www.propiedadesmexico.com"
 PER_PAGE = 12
+MAX_PAGES = 200  # tope de seguridad; la parada real es por total_pages/empty_streak
 
 # Selector estable: el patron /<a>/<b>/<c>/PM-<digitos> identifica un listing
 LISTING_HREF_RE = re.compile(r"/[^/\s]+/[^/\s]+/[^/\s]+/PM-\d+")
@@ -71,11 +96,6 @@ def set_page_param(url, page_num):
     q["page"] = [str(page_num)]
     new_q = urlencode({k: v[0] for k, v in q.items()})
     return urlunparse(parts._replace(query=new_q))
-
-
-def human_delay(a=1.2, b=3.0):
-    """Pausa aleatoria para simular ritmo humano."""
-    time.sleep(random.uniform(a, b))
 
 
 def clean_html_text(text):
@@ -155,7 +175,7 @@ def total_pages_from_html(html):
 # ignora los carruseles de 'sugerencias', decodifica /_next/image y
 # descarta slides duplicados de Swiper (modo loop).
 GALLERY_JS = r"""
-return (function(){
+() => {
   function decode(u){
     if(u && u.indexOf('/_next/image')>-1){
       var qs=(u.split('?')[1]||'');
@@ -185,23 +205,14 @@ return (function(){
     if(!seen[u]){ seen[u]=1; urls.push(u); }
   }
   return {urls:urls, total:total};
-})();
+}
 """
 
 
-def run_js(driver, script):
-    """Ejecuta JS en Botasaurus de forma tolerante al nombre del metodo."""
-    for meth in ("run_js", "evaluate", "execute_script"):
-        fn = getattr(driver, meth, None)
-        if callable(fn):
-            return fn(script)
-    raise AttributeError("No se encontro metodo de ejecucion JS en el Driver")
-
-
-def extract_gallery_images(driver):
+async def extract_gallery_images(page):
     """Extrae las URLs del carrusel del DOM. Devuelve (urls, total_esperado)."""
     try:
-        res = run_js(driver, GALLERY_JS)
+        res = await page.evaluate(GALLERY_JS)
         if isinstance(res, dict):
             return res.get("urls", []) or [], res.get("total")
     except Exception as e:
@@ -209,7 +220,7 @@ def extract_gallery_images(driver):
     return [], None
 
 
-def collect_all_images(driver, ssr_images):
+async def collect_all_images(page, ssr_images):
     """
     Combina las imagenes del DOM (carrusel) y del SSR (__NEXT_DATA__),
     priorizando el DOM cuando tenga imagenes, y usando SSR como respaldo.
@@ -217,7 +228,7 @@ def collect_all_images(driver, ssr_images):
     (por agrupacion de slides), por lo que no se usa como validacion
     cuando SSR trae mas fotos.
     """
-    dom_imgs, expected = extract_gallery_images(driver)
+    dom_imgs, expected = await extract_gallery_images(page)
 
     # Normaliza SSR: unescape de entidades URL (%281%29 -> (1))
     ssr = [unquote(u.split("?")[0]) for u in (ssr_images or [])]
@@ -236,9 +247,6 @@ def collect_all_images(driver, ssr_images):
     if expected and dom_imgs and len(chosen) < expected:
         status = f"parcial: {len(chosen)}/{expected}"
         print(f"   [img] solo {status} fotos (esperadas {expected})")
-    elif expected and len(chosen) != expected and len(chosen) > expected:
-        # DOM expected count is often lower than actual (grouped pagination) — normal
-        pass
 
     return chosen, expected, status
 
@@ -344,63 +352,45 @@ def parse_one(url, html):
 # ==========================================================================
 # FASE 1 — RECOLECCION DE URLs
 # ==========================================================================
-@browser(
-    headless=False,        # headful = menos detectable; pon True si lo prefieres
-    block_images=True,     # acelera (no necesitamos fotos en esta fase)
-    reuse_driver=True,     # UNA sola sesion para toda la paginacion
-    max_retry=3,
-    close_on_crash=True,
-    output=None,
-)
-def collect_listing_urls(driver: Driver, data):
+async def collect_listing_urls(search_url: str, max_pages: int | None = None) -> list[str]:
     """
-    data = {"search_url": <url>, "max_pages": int|None}
-    Devuelve la lista de URLs de listings (unicas).
-
     Parada robusta (doble criterio):
       1. Total de paginas calculado desde el <h1> ("Se han encontrado N").
       2. Se detiene si una pagina no aporta listings nuevos.
     """
-    search_url = data["search_url"]
-    max_pages = data.get("max_pages")
-
     collected, seen = [], set()
-    total_pages = None
-    page_num = 1
-    empty_streak = 0
+    state = {"total_pages": None, "empty_streak": 0}
+    cap = min(max_pages or MAX_PAGES, MAX_PAGES)
+    page_iter = tqdm(total=cap, desc="  Collecting pages", unit="pg", leave=False)
 
-    # Primera visita con referer de Google (mas natural)
-    driver.google_get(set_page_param(search_url, 1), bypass_cloudflare=True)
+    proxy_config = ProxyConfiguration(new_url_function=_dc_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=45),
+    )
 
-    page_iter = tqdm(desc=f"  Collecting pages", unit="pg")
-    while True:
-        if max_pages and page_num > max_pages:
-            break
-        if total_pages and page_num > total_pages:
-            break
-
-        url = set_page_param(search_url, page_num)
-        if page_num > 1:                  # page 1 ya cargada arriba
-            driver.get(url)
-
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        page_num = context.request.user_data["page_num"]
+        await context.block_requests()
         # CLAVE: esperar la HIDRATACION de Next.js antes de leer el HTML.
         try:
-            driver.wait_for_element(LISTING_SELECTOR, wait=15)
-        except Exception:
-            page_iter.close()
-            print(f"[Fase 1] page {page_num}: sin listings tras espera -> stop")
-            break
+            await context.page.wait_for_selector(LISTING_SELECTOR, timeout=15000)
+        except PlaywrightTimeoutError:
+            context.log.info("page %d: sin listings tras espera -> stop", page_num)
+            return
+        await context.page.mouse.wheel(0, 20000)
+        await context.page.wait_for_timeout(1200)
+        html = await context.page.content()
 
-        driver.scroll_to_bottom(smooth_scroll=True)
-        human_delay(0.8, 1.6)
-
-        html = driver.page_html
-
-        if total_pages is None:
+        if state["total_pages"] is None:
             total_pages, total = total_pages_from_html(html)
             if total_pages:
-                print(f"[Fase 1] Total: {total} resultados -> {total_pages} paginas")
-                page_iter = tqdm(total=total_pages, desc=f"  Collecting {total} results", unit="pg")
+                state["total_pages"] = total_pages
+                context.log.info("Total: %d resultados -> %d paginas", total, total_pages)
 
         new = 0
         for link in listing_hrefs_from_html(html):
@@ -408,95 +398,102 @@ def collect_listing_urls(driver: Driver, data):
                 seen.add(link)
                 collected.append(link)
                 new += 1
-        page_iter.set_description(f"  Page {page_num}: +{new} (acum {len(collected)})")
         page_iter.update(1)
+        page_iter.set_description(f"  Page {page_num}: +{new} (acum {len(collected)})")
+        context.log.info("page %d: +%d (acum %d)", page_num, new, len(collected))
 
         if new == 0:
-            empty_streak += 1
-            if empty_streak >= 10:
-                print(f"[Fase 1] page {page_num}: 10 consecutive empty pages -> stopping early")
-                break
+            state["empty_streak"] += 1
+            if state["empty_streak"] >= 10:
+                context.log.info("page %d: 10 paginas vacias seguidas -> stop", page_num)
+                return
         else:
-            empty_streak = 0
+            state["empty_streak"] = 0
 
-        page_num += 1
-        human_delay()
+        next_num = page_num + 1
+        if next_num <= cap and (state["total_pages"] is None or next_num <= state["total_pages"]):
+            next_url = set_page_param(search_url, next_num)
+            await context.add_requests([
+                Request.from_url(next_url, user_data={"page_num": next_num}, unique_key=f"p{next_num}")
+            ])
 
+    first_url = set_page_param(search_url, 1)
+    await crawler.run([Request.from_url(first_url, user_data={"page_num": 1}, unique_key="p1")])
+    page_iter.close()
     return collected
 
 
 # ==========================================================================
 # FASE 2 — EXTRACCION POR LISTING
-# Botasaurus ITERA la lista automaticamente: la funcion recibe UNA url (str)
-# y devuelve UN dict. NO hacer 'for url in urls' aqui dentro.
 # ==========================================================================
-@browser(
-    headless=False,
-    block_images=False,       # necesario: las imagenes deben cargar para el carrusel
-    reuse_driver=True,
-    max_retry=3,
-    close_on_crash=True,
-    output=None,
-)
-def extract_listings(driver: Driver, url: str):
-    """Recibe UNA url, devuelve UN dict con todos los campos + imagenes."""
-    global pbar
-    for attempt in range(1, 4):
+async def extract_listings(urls: list[str]) -> list[dict]:
+    """Entra a cada URL y devuelve la lista de records extraidos."""
+    results = []
+
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=45),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        # block_images=False en el original: las imagenes deben cargar para
+        # el carrusel, asi que solo bloqueamos CSS/fuentes, no imagenes.
+        # state="attached": <script> nunca es "visible" (sin caja visual),
+        # el default de Playwright esperaria eso para siempre y haria timeout.
+        await context.page.wait_for_selector("script#__NEXT_DATA__", timeout=15000, state="attached")
+
+        # Esperar a que el carrusel renderice para capturar TODAS las fotos
         try:
-            driver.google_get(url, bypass_cloudflare=True)
-            driver.wait_for_element("script#__NEXT_DATA__", wait=15)
+            await context.page.wait_for_selector(".swiper-pagination-total", timeout=10000)
+        except PlaywrightTimeoutError:
+            pass  # algunas publicaciones podrian tener 1 sola foto sin contador
 
-            # Esperar a que el carrusel renderice para capturar TODAS las fotos
-            try:
-                driver.wait_for_element(".swiper-pagination-total", wait=10)
-            except Exception:
-                pass  # algunas publicaciones podrian tener 1 sola foto sin contador
+        await context.page.wait_for_timeout(1000)
+        html = await context.page.content()
+        record = parse_one(context.request.url, html)
 
-            human_delay()
-            html = driver.page_html
-            record = parse_one(url, html)
+        # Imagenes: requieren el DOM renderizado
+        imgs, expected, status = await collect_all_images(context.page, record.get("_ssr_images"))
+        record["imagenes"] = imgs
+        record["num_imagenes"] = len(imgs)
+        record["imagenes_status"] = status
+        record.pop("_ssr_images", None)
 
-            # Imagenes: requieren el DOM renderizado -> usamos el driver
-            imgs, expected, status = collect_all_images(driver, record.get("_ssr_images"))
-            record["imagenes"] = imgs
-            record["num_imagenes"] = len(imgs)
-            record["imagenes_status"] = status        # "ok" o "parcial: x/y"
-            record.pop("_ssr_images", None)
+        if _cp_checkpoint:
+            _cp_checkpoint.done(context.request.url)
+        results.append(record)
+        if pbar:
+            pbar.update(1)
 
-            # Checkpoint
-            _cp_checkpoint.done(url)
+    async def failed_handler(context: PlaywrightCrawlingContext, error: Exception):
+        results.append({"url": context.request.url, "error": str(error)})
+        if pbar:
+            pbar.update(1)
 
-            if pbar: pbar.update(1)
-            return record
-        except Exception as e:
-            if attempt < 3:
-                delay = 3 * attempt
-                print(f"   [retry] {url} — attempt {attempt}/3: {e}, waiting {delay}s")
-                time.sleep(delay)
-            else:
-                if pbar: pbar.update(1)
-                return {"url": url, "error": f"{e} [after 3 retries]"}
+    crawler.failed_request_handler(failed_handler)
+
+    await crawler.run([Request.from_url(u) for u in urls])
+    return results
 
 
 # ==========================================================================
 # ORQUESTADOR
 # ==========================================================================
-def scrape(search_urls, max_pages=None, max_listings=None):
+async def scrape(search_urls, max_pages=None, max_listings=None):
     all_urls = []
 
     # ----- FASE 1 -----
     for search_url in search_urls:
         print(f"\n[Fase 1] Procesando URL: {search_url}")
-        urls = collect_listing_urls({"search_url": search_url, "max_pages": max_pages})
+        urls = await collect_listing_urls(search_url, max_pages=max_pages)
         all_urls.extend(urls)
 
-    unique_urls = []
-    seen = set()
-    for u in all_urls:
-        if u not in seen:
-            unique_urls.append(u)
-            seen.add(u)
-
+    unique_urls = list(dict.fromkeys(all_urls))
     print(f"\n[Fase 1] {len(all_urls)} listings totales, {len(unique_urls)} únicos.\n")
 
     if max_listings:
@@ -514,7 +511,6 @@ def scrape(search_urls, max_pages=None, max_listings=None):
     # ----- FASE 2 -----
     global pbar, _cp_checkpoint
 
-    # Checkpoint for resumable Phase 2
     _cp_checkpoint = Checkpoint("output/propiedades_checkpoint.json")
     unique_urls = _cp_checkpoint.resume(unique_urls)
     if not unique_urls:
@@ -522,8 +518,9 @@ def scrape(search_urls, max_pages=None, max_listings=None):
 
     setup_graceful_shutdown()
     pbar = tqdm(total=len(unique_urls), desc="Fase 2 (Propiedades)")
-    results = extract_listings(unique_urls)
-    if pbar: pbar.close()
+    results = await extract_listings(unique_urls)
+    if pbar:
+        pbar.close()
 
     os.makedirs("output", exist_ok=True)
     atomic_write_json(results, OUTPUT_FILE, indent=2)
@@ -537,7 +534,7 @@ def scrape(search_urls, max_pages=None, max_listings=None):
     return results
 
 
-if __name__ == "__main__":
+async def main():
     try:
         with open("scrape_links.json", "r", encoding="utf-8") as f:
             links_data = json.load(f)
@@ -548,6 +545,10 @@ if __name__ == "__main__":
 
     if search_urls:
         # max_pages / max_listings son opcionales (utiles para pruebas)
-        scrape(search_urls, max_pages=None, max_listings=None)
+        await scrape(search_urls, max_pages=None, max_listings=None)
     else:
         print("No hay URLs para procesar. Agrega enlaces a la clave 'propiedadesmx' en scrape_links.json.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

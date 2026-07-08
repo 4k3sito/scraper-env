@@ -1,5 +1,6 @@
 # inmuebles24_scraper.py
-# Botasaurus (browser + anti-detection) + Scrapling 0.4.9 (adaptive parsing)
+# Crawlee (PlaywrightCrawler — driver, proxy, sesiones, reintentos y
+# deteccion de bloqueo nativa) + Scrapling 0.4.9 (adaptive parsing)
 #
 # CAMBIO CLAVE — COORDENADAS:
 #   En Inmuebles24 lat/lon NO estan en el JSON-LD (que suele ser solo
@@ -7,21 +8,52 @@
 #   objeto JSON inline bajo las claves postingGeolocation / geolocation con
 #   el formato:  "latitude":17.9672...  "longitude":-92.9375...
 #   (numeros SIN comillas, latitude antes que longitude). El HTML debe leerse
-#   despues de la hidratacion (tras wait_for_element + un pequeño delay).
+#   despues de la hidratacion (tras esperar el selector + un pequeño delay).
 
+import asyncio
 import os, sys
-import time, json, csv, random, re, html as ihtml
+import json, csv, re, html as ihtml
+from datetime import timedelta
+from functools import lru_cache
 from urllib.parse import urljoin
 
 from tqdm import tqdm
+from crawlee import Request
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.proxy_configuration import ProxyConfiguration
+from crawlee.storage_clients import MemoryStorageClient
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapling.parser import Selector
-from botasaurus import bt
-from botasaurus.browser import browser, Driver
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint, setup_log
 from src.parser import parse_description, merge_parsed
+from src.proxy import ApifyProxyConfig
+
+# ponytail: datacenter para paginar (barato), residencial para el detalle
+# (donde el sitio bloquea mas fuerte). Lazy: solo exige APIFY_PROXY_PASSWORD
+# al correr de verdad, no al importar el modulo.
+@lru_cache(maxsize=None)
+def _proxy(groups):
+    # "auto" -> grupo datacenter dedicado, con password propia (grupo comprado
+    # aparte, no cubierto por APIFY_PROXY_PASSWORD general).
+    if groups == "auto":
+        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
+    return ApifyProxyConfig(groups=groups)
+
+
+async def _dc_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
+
+
+async def _res_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+
 
 ORIGIN = "https://www.inmuebles24.com"
 MAX_PAGES = 57   # 1,689 results / ~30 per page ≈ 57 pages
+LISTING_WAIT_SELECTOR = (
+    '[data-qa="posting PROPERTY"], [data-posting-id], article[class*="card"], '
+    '.posting-card, [class*="Posting"]'
+)
 
 # Module-level checkpoint ref (set in __main__, used by extract_details)
 _cp_checkpoint = None
@@ -147,69 +179,82 @@ def parse_listing_cards(html: str):
     return out
 
 
-@browser(headless=False, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def collect_urls(driver: Driver, search_urls):
+async def collect_urls_for(search_url: str) -> list[dict]:
+    """Pagina un search_url y devuelve listings unicos {id, url}.
+
+    Encadena la pagina N+1 solo si la pagina N aporto cards nuevas (para
+    exactamente en "hasta agotar", igual que Fase 1 de Pincali).
+    """
+    base_path = search_url.split(".html")[0]
+    seen = {}
+    page_iter = tqdm(total=MAX_PAGES, desc="  Collecting pages", unit="pg", leave=False)
+
+    # Residencial en las dos fases: verificado que este sitio devuelve 403
+    # (bloqueo) con el proxy datacenter incluso para la busqueda (Fase 1),
+    # a diferencia de Pincali/PropiedadesMX donde datacenter si funciona.
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=45),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        page_num = context.request.user_data["page_num"]
+        await context.block_requests()
+
+        title = await context.page.title()
+        if "Just a moment" in title:
+            raise RuntimeError("Cloudflare challenge not resolved")
+
+        try:
+            await context.page.wait_for_selector(LISTING_WAIT_SELECTOR, timeout=5000)
+            await context.page.mouse.wheel(0, 20000)  # trigger lazy content
+            await context.page.wait_for_timeout(400)
+        except PlaywrightTimeoutError:
+            pass  # fallback: intentar de todos modos con regex
+
+        html = await context.page.content()
+        cards = parse_listing_cards(html) or _fallback_cards(html, ORIGIN)
+
+        added = 0
+        for c in cards:
+            if c["id"] not in seen:
+                seen[c["id"]] = c
+                added += 1
+        page_iter.update(1)
+        page_iter.set_description(f"  Page {page_num}: {len(cards)} cards, +{added} new")
+        page_iter.set_postfix(unique=len(seen))
+        context.log.info("page %d: %d cards, +%d new (total %d)", page_num, len(cards), added, len(seen))
+
+        if not cards or added == 0:
+            context.log.info("page %d: 0 cards nuevas -> stop", page_num)
+            return
+
+        if page_num < MAX_PAGES:
+            next_num = page_num + 1
+            next_url = f"{base_path}.html" if next_num == 1 else f"{base_path}-pagina-{next_num}.html"
+            await context.add_requests([
+                Request.from_url(next_url, user_data={"page_num": next_num}, unique_key=f"p{next_num}")
+            ])
+
+    first_url = f"{base_path}.html"
+    await crawler.run([Request.from_url(first_url, user_data={"page_num": 1}, unique_key="p1")])
+    page_iter.close()
+    return list(seen.values())
+
+
+async def collect_urls(search_urls: list[str]) -> list[dict]:
+    """Pagina TODOS los search_urls y devuelve listings unicos {id, url}."""
     seen = {}
     for search_url in search_urls:
         print(f"\n[PHASE 1] Processing: {search_url}")
-        base_path = search_url.split(".html")[0]
-
-        page_iter = tqdm(range(1, MAX_PAGES + 1), desc=f"  Collecting pages", unit="pg", leave=False)
-        for p in page_iter:
-            url = f"{base_path}.html" if p == 1 else f"{base_path}-pagina-{p}.html"
-            driver.get(url)
-
-            # Cloudflare challenge: esperar hasta 12s a que resuelva (headful)
-            for _ in range(12):
-                if "Just a moment" not in driver.title:
-                    break
-                time.sleep(1)
-            else:
-                print(f"page {p}: Cloudflare no resuelve -> stopping early")
-                break
-
-            # Wait for listing cards to load
-            try:
-                driver.wait_for_element(
-                    '[data-qa="posting PROPERTY"], [data-posting-id], article[class*="card"], '
-                    '.posting-card, [class*="Posting"]',
-                    wait=5,
-                )
-                # Scroll to trigger lazy content
-                driver.scroll_to_bottom(smooth_scroll=True)
-                time.sleep(random.uniform(0.5, 1.2))
-                driver.run_js("window.scrollTo(0, 0);")
-                time.sleep(random.uniform(0.3, 0.8))
-            except Exception:
-                # Fallback: wait for body and try regex extraction
-                try:
-                    driver.wait_for_element("body", wait=2)
-                except Exception:
-                    print(f"page {p}: pagina no cargo -> stop")
-                    break
-
-            html = driver.page_html
-
-            # Primary: Scrapling CSS extraction
-            cards = parse_listing_cards(html)
-            # Fallback: regex extraction if CSS found nothing
-            if not cards:
-                cards = _fallback_cards(html, ORIGIN)
-
-            added = 0
-            for c in cards:
-                if c["id"] not in seen:
-                    seen[c["id"]] = c
-                    added += 1
-            page_iter.set_description(f"  Page {p}: {len(cards)} cards, +{added} new, total {len(seen)}")
-            page_iter.set_postfix(unique=len(seen))
-
-            if not cards or added == 0:
-                print(f"page {p}: 0 cards found -> stopping early")
-                break
-            time.sleep(random.uniform(1.5, 3.0))
-
+        for c in await collect_urls_for(search_url):
+            if c["id"] not in seen:
+                seen[c["id"]] = c
     return list(seen.values())
 
 
@@ -284,29 +329,43 @@ def parse_detail(html: str) -> dict:
     return record
 
 
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def extract_details(driver: Driver, listing):
-    """Botasaurus itera la lista: recibe UN listing, devuelve UN dict."""
-    global pbar
-    url = listing["url"]
-    for attempt in range(1, 4):
-        try:
-            driver.get(url)
-            driver.wait_for_element("h1", wait=15)
-            d = parse_detail(driver.page_html)
-            d.update(id=listing["id"], url=url)
-            _cp_checkpoint.done(url)
-            break
-        except Exception as e:
-            d = {"id": listing["id"], "url": url, "error": str(e)}
-            if attempt < 3:
-                delay = 3 * attempt
-                print(f"   [retry] {url} — attempt {attempt}/3: {e}, waiting {delay}s")
-                time.sleep(delay)
-    if pbar:
-        pbar.update(1)
-    return d
+async def extract_details(listings: list[dict]) -> list[dict]:
+    """Entra a cada listing {id, url} y devuelve la lista de records extraidos."""
+    results = []
+
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=30),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        await context.block_requests()
+        await context.page.wait_for_selector("h1", timeout=15000)
+        html = await context.page.content()
+        d = parse_detail(html)
+        d.update(id=context.request.user_data["id"], url=context.request.url)
+        if _cp_checkpoint:
+            _cp_checkpoint.done(context.request.url)
+        results.append(d)
+        if pbar:
+            pbar.update(1)
+
+    async def failed_handler(context: PlaywrightCrawlingContext, error: Exception):
+        results.append({"id": context.request.user_data["id"], "url": context.request.url, "error": str(error)})
+        if pbar:
+            pbar.update(1)
+
+    crawler.failed_request_handler(failed_handler)
+
+    await crawler.run([
+        Request.from_url(l["url"], user_data={"id": l["id"]}) for l in listings
+    ])
+    return results
 
 
 # ----------------------- output -----------------------
@@ -329,21 +388,15 @@ def write_csv(rows, path):
             w.writerow(row)
 
 
-def selftest(url=None):
+async def selftest(url=None):
     """Verifica coordenadas en una URL de detalle.
     Uso:  python -m src.inmuebles24 --selftest <URL>
     """
     if url is None:
         raise SystemExit("Pasa una URL de detalle:  python -m src.inmuebles24 --selftest <URL>")
 
-    @browser(headless=True, block_images=True, output=None)
-    def _one(driver: Driver, u):
-        driver.get(u)
-        driver.wait_for_element("h1", wait=15)
-        return parse_detail(driver.page_html)
-
-    result = _one(url)
-    result.update(id="test", url=url)
+    results = await extract_details([{"id": "test", "url": url}])
+    result = results[0] if results else {}
     lat, lon = result.get("lat"), result.get("lon")
     ok = valid_mx(lat, lon)
     print("\n[selftest inmuebles24]")
@@ -356,15 +409,17 @@ def selftest(url=None):
     return ok
 
 
-if __name__ == "__main__":
+async def main():
+    global pbar, _cp_checkpoint
+
     os.makedirs("output", exist_ok=True)
     log = setup_log("inmuebles24")
 
     if "--selftest" in sys.argv:
         idx = sys.argv.index("--selftest")
         _url = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
-        selftest(_url)
-        raise SystemExit(0)
+        await selftest(_url)
+        return
 
     try:
         with open("scrape_links.json", "r", encoding="utf-8") as f:
@@ -384,7 +439,7 @@ if __name__ == "__main__":
 
     print("PHASE 1: collecting URLs...")
     search_urls_list = search_urls[:1] if sample_n else search_urls
-    urls = (collect_urls([search_urls_list]) or [[]])[0] or []
+    urls = await collect_urls(search_urls_list)
     if sample_n:
         urls = urls[:sample_n]
     atomic_write_json(urls, "output/inm24_urls.json", indent=2)
@@ -409,9 +464,9 @@ if __name__ == "__main__":
         raise SystemExit("All URLs already extracted — checkpoint shows nothing to do.")
 
     setup_graceful_shutdown()
-    print(f"PHASE 2: extracting details...")
+    print("PHASE 2: extracting details...")
     pbar = tqdm(total=len(urls), desc="Fase 2 (Inmuebles24)")
-    listings = extract_details(urls) or []
+    listings = await extract_details(urls)
     if pbar:
         pbar.close()
     listings = [r for r in listings if isinstance(r, dict)]
@@ -425,3 +480,7 @@ if __name__ == "__main__":
         print(f"[db] upsert failed: {e}")
     ok = sum(1 for r in listings if "error" not in r)
     log.info("PHASE 2 complete: %d/%d OK", ok, len(listings))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

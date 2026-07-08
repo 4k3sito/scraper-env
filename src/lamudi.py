@@ -1,23 +1,54 @@
 # lamudi.py
-# Botasaurus (browser + anti-detection) + Scrapling 0.4.9 (adaptive parsing)
+# Crawlee (PlaywrightCrawler — driver, proxy, sesiones, reintentos y
+# deteccion de bloqueo nativa) + Scrapling 0.4.9 (adaptive parsing)
 
-import os, sys, time, json, csv, random, re, base64
+import asyncio
+import os, sys, json, csv, re, base64
+from datetime import timedelta
+from functools import lru_cache
 from urllib.parse import urljoin
 
 from tqdm import tqdm
-from src.utils import atomic_write_json, setup_graceful_shutdown, should_stop, setup_log
-from botasaurus import bt
-from botasaurus.browser import browser, Driver
+from crawlee import Request
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.proxy_configuration import ProxyConfiguration
+from crawlee.storage_clients import MemoryStorageClient
 from scrapling.parser import Selector
+from src.utils import atomic_write_json, setup_graceful_shutdown, setup_log, Checkpoint
 from src.parser import parse_description, merge_parsed
+from src.proxy import ApifyProxyConfig
+
+# ponytail: datacenter para paginar (barato), residencial para el detalle
+# (donde el sitio bloquea mas fuerte). Lazy: solo exige APIFY_PROXY_PASSWORD
+# al correr de verdad, no al importar el modulo.
+@lru_cache(maxsize=None)
+def _proxy(groups):
+    # "auto" -> grupo datacenter dedicado, con password propia (grupo comprado
+    # aparte, no cubierto por APIFY_PROXY_PASSWORD general).
+    if groups == "auto":
+        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
+    return ApifyProxyConfig(groups=groups)
+
+
+async def _dc_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
+
+
+async def _res_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+
 
 BASE = "https://www.lamudi.com.mx/nuevo-leon/monterrey/comercial/venta-al-por-menor/for-sale/"
 BOUNDS = "-100.47016411545054,25.419606909860605,-100.09276415132233,25.838957457589444"
 ORIGIN = "https://www.lamudi.com.mx"
 MAX_PAGES = 30  # real set ends at page 16 (~454 cards / 446 unique)
+EMPTY_STREAK_LIMIT = 10
 
 SIZE_SPEC_KEYS = ("Superficie total", "Superficie de terreno",
                   "Superficie construida", "Superficie útil", "Superficie")
+
+pbar = None
+_cp_checkpoint = None
 
 
 def _page(html: str) -> Selector:
@@ -113,56 +144,78 @@ def parse_listing_cards(html: str):
     return out
 
 
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def collect_urls(driver: Driver, search_urls):
+async def collect_urls_for(base_url: str) -> list[dict]:
+    """Pagina un search_url y devuelve listings unicos {id, url, lat, lng}.
+
+    Encadena la pagina N+1 solo si la anterior no rompio la racha de vacias
+    y el HTML anuncia una pagina siguiente (mismo criterio que la version
+    Botasaurus original: has_next via 'page={p+1}' en el HTML + empty_streak).
+    """
+    if "?" in base_url:
+        base, qs = base_url.split("?", 1)
+        query_prefix = f"&{qs}"
+    else:
+        base, query_prefix = base_url, ""
+
+    seen = {}
+    state = {"empty_streak": 0}
+    page_iter = tqdm(total=MAX_PAGES, desc="  Collecting pages", unit="pg", leave=False)
+
+    proxy_config = ProxyConfiguration(new_url_function=_dc_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=45),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        page_num = context.request.user_data["page_num"]
+        await context.block_requests()
+        await context.page.wait_for_selector(".js-snippet", timeout=15000)
+        html = await context.page.content()
+        cards = parse_listing_cards(html)
+
+        added = 0
+        for c in cards:
+            if c["id"] not in seen:
+                seen[c["id"]] = c
+                added += 1
+        page_iter.update(1)
+        page_iter.set_description(f"  Page {page_num}: {len(cards)} cards, +{added} new")
+        page_iter.set_postfix(unique=len(seen))
+        context.log.info("page %d: %d cards, +%d new (total %d)", page_num, len(cards), added, len(seen))
+
+        if not cards or added == 0:
+            state["empty_streak"] += 1
+            if state["empty_streak"] >= EMPTY_STREAK_LIMIT:
+                context.log.info("page %d: %d paginas vacias seguidas -> stop", page_num, EMPTY_STREAK_LIMIT)
+                return
+        else:
+            state["empty_streak"] = 0
+
+        has_next = f'page={page_num + 1}"' in html or f"page={page_num + 1}'" in html
+        if has_next and page_num < MAX_PAGES:
+            next_url = f"{base}?page={page_num + 1}{query_prefix}"
+            await context.add_requests([
+                Request.from_url(next_url, user_data={"page_num": page_num + 1}, unique_key=f"p{page_num + 1}")
+            ])
+
+    first_url = f"{base}?page=1{query_prefix}"
+    await crawler.run([Request.from_url(first_url, user_data={"page_num": 1}, unique_key="p1")])
+    page_iter.close()
+    return list(seen.values())
+
+
+async def collect_urls(search_urls: list[str]) -> list[dict]:
     seen = {}
     for base_url in search_urls:
         print(f"\n[PHASE 1] Processing: {base_url}")
-
-        if "?" in base_url:
-            base, qs = base_url.split("?", 1)
-            query_prefix = f"&{qs}"
-        else:
-            base = base_url
-            query_prefix = ""
-
-        empty_streak = 0
-        page_iter = tqdm(range(1, MAX_PAGES + 1), desc=f"  Collecting pages", unit="pg", leave=False)
-        for p in page_iter:
-            url = f"{base}?page={p}{query_prefix}"
-            try:
-                driver.google_get(url, bypass_cloudflare=True)
-                driver.wait_for_element(".js-snippet", wait=15)
-                driver.scroll_to_bottom(smooth_scroll=True)
-                time.sleep(random.uniform(0.5, 1.0))
-                driver.run_js("window.scrollTo(0, 0);")
-                time.sleep(random.uniform(0.3, 0.7))
-            except Exception:
-                print(f"page {p}: sin resultados -> stop")
-                break
-            html = driver.page_html
-            cards = parse_listing_cards(html)
-
-            added = 0
-            for c in cards:
-                if c["id"] not in seen:
-                    seen[c["id"]] = c
-                    added += 1
-            page_iter.set_description(f"  Page {p}: {len(cards)} cards, +{added} new, total {len(seen)}")
-            page_iter.set_postfix(unique=len(seen))
-
-            has_next = f'page={p + 1}"' in html or f"page={p + 1}'" in html
-            if not cards or added == 0:
-                empty_streak += 1
-                if empty_streak >= 10:
-                    print(f"page {p}: 10 consecutive empty pages -> stopping early")
-                    break
-            else:
-                empty_streak = 0
-            if not has_next:
-                break
-            time.sleep(random.uniform(2.0, 4.0))
+        for c in await collect_urls_for(base_url):
+            if c["id"] not in seen:
+                seen[c["id"]] = c
     return list(seen.values())
 
 
@@ -254,38 +307,50 @@ def parse_detail(html: str) -> dict:
     return record
 
 
-pbar = None
+async def extract_details(listings: list[dict]) -> list[dict]:
+    """Entra a cada listing {id, url, lat, lng} y devuelve records extraidos."""
+    results = []
 
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=30),
+    )
 
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def extract_details(driver: Driver, listing):
-    """Botasaurus itera la lista de cards: recibe UNO, devuelve UN dict."""
-    global pbar
-    url = listing["url"]
-    for attempt in range(1, 4):
-        try:
-            driver.get(url)
-            driver.wait_for_element("h1", wait=15)
-            d = parse_detail(driver.page_html)
-            d.update(url=url, lat=listing.get("lat"), lng=listing.get("lng"))
-            # backfill listing-card coords from detail page if the card lacked them
-            if d.get("lat") is None:
-                d["lat"] = d.get("map_lat")
-            if d.get("lng") is None:
-                d["lng"] = d.get("map_lng")
-            # success — mark checkpoint
-            _cp_checkpoint.done(url)
-            break
-        except Exception as e:
-            d = {"url": url, "error": str(e)}
-            if attempt < 3:
-                delay = 3 * attempt
-                print(f"   [retry] {url} — attempt {attempt}/3: {e}, waiting {delay}s")
-                time.sleep(delay)
-    if pbar:
-        pbar.update(1)
-    return d
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        await context.block_requests()
+        await context.page.wait_for_selector("h1", timeout=15000)
+        html = await context.page.content()
+        d = parse_detail(html)
+        ud = context.request.user_data
+        d.update(url=context.request.url, lat=ud.get("lat"), lng=ud.get("lng"))
+        # backfill listing-card coords from detail page if the card lacked them
+        if d.get("lat") is None:
+            d["lat"] = d.get("map_lat")
+        if d.get("lng") is None:
+            d["lng"] = d.get("map_lng")
+        if _cp_checkpoint:
+            _cp_checkpoint.done(context.request.url)
+        results.append(d)
+        if pbar:
+            pbar.update(1)
+
+    async def failed_handler(context: PlaywrightCrawlingContext, error: Exception):
+        results.append({"url": context.request.url, "error": str(error)})
+        if pbar:
+            pbar.update(1)
+
+    crawler.failed_request_handler(failed_handler)
+
+    await crawler.run([
+        Request.from_url(l["url"], user_data={"lat": l.get("lat"), "lng": l.get("lng")})
+        for l in listings
+    ])
+    return results
 
 
 def write_csv(rows, path):
@@ -307,7 +372,9 @@ def write_csv(rows, path):
             w.writerow(row)
 
 
-if __name__ == "__main__":
+async def main():
+    global pbar, _cp_checkpoint
+
     os.makedirs("output", exist_ok=True)
     log = setup_log("lamudi")
 
@@ -323,10 +390,8 @@ if __name__ == "__main__":
         raise SystemExit("No URLs to process. Add links to 'lamudi' in scrape_links.json")
 
     print("PHASE 1: collecting URLs...")
-    # Wrap in a list: botasaurus iterates list data per-item, so [search_urls]
-    # passes the whole list to one call; result comes back wrapped too.
-    urls = (collect_urls([search_urls]) or [[]])[0] or []
-    bt.write_json(urls, "output/lamudi_urls.json")
+    urls = await collect_urls(search_urls)
+    atomic_write_json(urls, "output/lamudi_urls.json", indent=2)
     log.info("PHASE 1 complete: %d unique URLs", len(urls))
 
     if not urls:
@@ -342,7 +407,7 @@ if __name__ == "__main__":
         raise SystemExit("Nothing new to scrape — DB already up to date.")
 
     # Checkpoint for resumable Phase 2
-    _cp_checkpoint = __import__("src.utils", fromlist=["Checkpoint"]).Checkpoint("output/lamudi_checkpoint.json")
+    _cp_checkpoint = Checkpoint("output/lamudi_checkpoint.json")
     urls = _cp_checkpoint.resume(urls, key=lambda x: x["url"])
     if not urls:
         raise SystemExit("All URLs already extracted — checkpoint shows nothing to do.")
@@ -350,7 +415,7 @@ if __name__ == "__main__":
     setup_graceful_shutdown()
     print("PHASE 2: extracting details...")
     pbar = tqdm(total=len(urls), desc="Fase 2 (Lamudi)")
-    listings = extract_details(urls) or []
+    listings = await extract_details(urls)
     pbar.close()
 
     # Write output atomically
@@ -365,3 +430,7 @@ if __name__ == "__main__":
         db.upsert("lamudi", listings)
     except Exception as e:
         print(f"[db] upsert skipped: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

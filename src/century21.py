@@ -1,25 +1,48 @@
 # century21.py
-# Century21 Mexico scraper. Botasaurus (browser) + Scrapling (parser).
+# Century21 Mexico scraper. Crawlee (PlaywrightCrawler — driver, proxy,
+# sesiones, reintentos y deteccion de bloqueo nativa) + Scrapling (parser).
 #
 # The site is Vue-rendered: listing data loads via XHR, but the detail page
 # does contain structured data in JSON-LD and inline HTML after rendering.
-# We use Botasaurus to load pages and Scrapling to parse the DOM.
 #
-# PHASE 1: paginate search result pages via Botasaurus, extract detail URLs
+# PHASE 1: paginate search result pages, extract detail URLs
 # PHASE 2: load each detail page, extract fields from HTML + JSON-LD
 
-import os, time, json, re, random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import os, json, re
+from datetime import timedelta
+from functools import lru_cache
 
 from tqdm import tqdm
+from crawlee import Request
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.proxy_configuration import ProxyConfiguration
+from crawlee.storage_clients import MemoryStorageClient
 from scrapling.parser import Selector
-from botasaurus.browser import browser, Driver
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint
 from src.parser import parse_description, merge_parsed
+from src.proxy import ApifyProxyConfig
+
+# ponytail: datacenter para paginar (barato), residencial para el detalle
+# (donde el sitio bloquea mas fuerte). Lazy: solo exige APIFY_PROXY_PASSWORD
+# al correr de verdad, no al importar el modulo.
+@lru_cache(maxsize=None)
+def _proxy(groups):
+    # "auto" -> grupo datacenter dedicado, con password propia (grupo comprado
+    # aparte, no cubierto por APIFY_PROXY_PASSWORD general). No usado
+    # actualmente (ambas fases corren en RESIDENTIAL, ver comentario abajo),
+    # pero se deja consistente con el resto de scrapers.
+    if groups == "auto":
+        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
+    return ApifyProxyConfig(groups=groups)
+
+
+async def _res_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+
 
 ORIGIN = "https://century21mexico.com"
 MAX_PAGES = 30
-FAIL_LIMIT = 10
 OUTPUT_FILE = "output/century21.json"
 
 _cp_checkpoint = None
@@ -48,70 +71,101 @@ def _maps_link(lat, lon):
     return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
 
 
-# ----------------------- PHASE 1: collect listing URLs -----------------------
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def collect_urls(driver: Driver, search_urls):
-    """Collect unique listing URLs by paginating search result pages."""
-    seen = {}
-    for search_url in search_urls:
-        print(f"\n[PHASE 1] {search_url}")
-        page_iter = tqdm(range(1, MAX_PAGES + 1), desc=f"  Collecting pages", unit="pg", leave=False)
-        for p in page_iter:
-            url = _page_url(search_url, p)
-            try:
-                driver.google_get(url, bypass_cloudflare=True)
-                driver.wait_for_element("body", wait=15)
-                time.sleep(1.5)
-                driver.scroll_to_bottom(smooth_scroll=True)
-                time.sleep(random.uniform(0.5, 1.0))
-                driver.run_js("window.scrollTo(0, 0);")
-                time.sleep(random.uniform(0.3, 0.7))
-            except Exception as e:
-                print(f"  page {p}: {e} -> stop")
-                break
-            html = driver.page_html
-            page = _page(html)
-
-            added = 0
-            for a in page.css('a[href*="propiedad/"], a[href*="/detalle/"]'):
-                href = a.attrib.get("href", "")
-                if not href or "javascript" in href:
-                    continue
-                full = href if href.startswith("http") else ORIGIN + href
-                rid = re.search(r"/(\d+)(?:/|\?|$)", full)
-                rid = rid.group(1) if rid else full
-                if rid not in seen:
-                    seen[rid] = {"id": rid, "url": full.split("?")[0]}
-                    added += 1
-
-            for block in page.css('script[type="application/ld+json"]::text').getall():
-                try:
-                    data = json.loads(block)
-                except json.JSONDecodeError:
-                    continue
-                for item in (data if isinstance(data, list) else [data]):
-                    if isinstance(item, dict) and "url" in item.get("mainEntityOfPage", {}):
-                        u = item["mainEntityOfPage"]["url"]
-                        rid = re.search(r"/(\d+)", u)
-                        if rid and rid.group(1) not in seen:
-                            seen[rid.group(1)] = {"id": rid.group(1), "url": u}
-                            added += 1
-
-            page_iter.set_description(f"  Page {p}: +{added} new, {len(seen)} total")
-            page_iter.set_postfix(unique=len(seen))
-            if added == 0:
-                break
-            time.sleep(1.5)
-    return list(seen.values())
-
-
 def _page_url(url, page=None):
     """Build the URL for a given page number."""
     base = url.split("?")[0].rstrip("/")
     if page and page > 1:
         return f"{base}/pagina_{page}"
     return base
+
+
+# ----------------------- PHASE 1: collect listing URLs -----------------------
+def _cards_from_html(html):
+    """Devuelve dict {id: {id, url}} de una pagina de resultados."""
+    page = _page(html)
+    found = {}
+    for a in page.css('a[href*="propiedad/"], a[href*="/detalle/"]'):
+        href = a.attrib.get("href", "")
+        if not href or "javascript" in href:
+            continue
+        full = href if href.startswith("http") else ORIGIN + href
+        rid = re.search(r"/(\d+)(?:/|\?|$)", full)
+        rid = rid.group(1) if rid else full
+        found[rid] = {"id": rid, "url": full.split("?")[0]}
+
+    for block in page.css('script[type="application/ld+json"]::text').getall():
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if isinstance(item, dict) and "url" in item.get("mainEntityOfPage", {}):
+                u = item["mainEntityOfPage"]["url"]
+                rid = re.search(r"/(\d+)", u)
+                if rid:
+                    found[rid.group(1)] = {"id": rid.group(1), "url": u}
+    return found
+
+
+async def collect_urls_for(search_url: str) -> list[dict]:
+    seen = {}
+    page_iter = tqdm(total=MAX_PAGES, desc="  Collecting pages", unit="pg", leave=False)
+
+    # RESIDENTIAL en ambas fases: verificado que el Cloudflare de este sitio
+    # corta el tunel con IPs datacenter (ERR_TUNNEL_CONNECTION_FAILED), pero
+    # pasa limpio con residencial.
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=45),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        page_num = context.request.user_data["page_num"]
+        await context.block_requests()
+        await context.page.wait_for_load_state("networkidle", timeout=15000)
+        html = await context.page.content()
+
+        cards = _cards_from_html(html)
+        added = 0
+        for rid, c in cards.items():
+            if rid not in seen:
+                seen[rid] = c
+                added += 1
+        page_iter.update(1)
+        page_iter.set_description(f"  Page {page_num}: +{added} new, {len(seen)} total")
+        page_iter.set_postfix(unique=len(seen))
+        context.log.info("page %d: +%d new (total %d)", page_num, added, len(seen))
+
+        if added == 0:
+            context.log.info("page %d: 0 nuevos -> stop", page_num)
+            return
+
+        if page_num < MAX_PAGES:
+            next_num = page_num + 1
+            next_url = _page_url(search_url, next_num)
+            await context.add_requests([
+                Request.from_url(next_url, user_data={"page_num": next_num}, unique_key=f"p{next_num}")
+            ])
+
+    first_url = _page_url(search_url, 1)
+    await crawler.run([Request.from_url(first_url, user_data={"page_num": 1}, unique_key="p1")])
+    page_iter.close()
+    return list(seen.values())
+
+
+async def collect_urls(search_urls: list[str]) -> list[dict]:
+    seen = {}
+    for search_url in search_urls:
+        print(f"\n[PHASE 1] {search_url}")
+        for c in await collect_urls_for(search_url):
+            if c["id"] not in seen:
+                seen[c["id"]] = c
+    return list(seen.values())
 
 
 # ----------------------- PHASE 2: extract one detail page -----------------------
@@ -214,35 +268,51 @@ def _extract_ld(html):
     return None
 
 
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def extract_detail(driver: Driver, listing):
-    """Botasaurus itera: recibe UN listing, devuelve UN dict."""
-    global pbar
-    for attempt in range(1, 4):
-        try:
-            driver.get(listing["url"])
-            driver.wait_for_element("body", wait=15)
-            time.sleep(2)
-            html = driver.page_html
-            rec = parse_detail(html, listing)
-            if rec.get("description"):
-                merge_parsed(rec, parse_description(rec["description"]))
+async def extract_details(listings: list[dict]) -> list[dict]:
+    """Entra a cada listing {id, url} y devuelve records extraidos."""
+    results = []
+
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=30),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        await context.block_requests()
+        await context.page.wait_for_load_state("networkidle", timeout=15000)
+        html = await context.page.content()
+        listing = context.request.user_data
+        rec = parse_detail(html, listing)
+        if rec.get("description"):
+            merge_parsed(rec, parse_description(rec["description"]))
+        if _cp_checkpoint:
             _cp_checkpoint.done(listing["url"])
-            if pbar:
-                pbar.update(1)
-            return rec
-        except Exception as e:
-            if attempt < 3:
-                delay = 3 * attempt
-                print(f"   [retry] {listing['url']} — attempt {attempt}/3: {e}, waiting {delay}s")
-                time.sleep(delay)
-    if pbar:
-        pbar.update(1)
-    return {"id": listing.get("id"), "url": listing.get("url"), "error": "failed after 3 retries"}
+        results.append(rec)
+        if pbar:
+            pbar.update(1)
+
+    async def failed_handler(context: PlaywrightCrawlingContext, error: Exception):
+        listing = context.request.user_data
+        results.append({"id": listing.get("id"), "url": context.request.url, "error": str(error)})
+        if pbar:
+            pbar.update(1)
+
+    crawler.failed_request_handler(failed_handler)
+
+    await crawler.run([
+        Request.from_url(l["url"], user_data={"id": l["id"], "url": l["url"]}) for l in listings
+    ])
+    return results
 
 
-if __name__ == "__main__":
+async def main():
+    global pbar, _cp_checkpoint
+
     try:
         with open("scrape_links.json", encoding="utf-8") as f:
             search_urls = json.load(f).get("century21", [])
@@ -252,7 +322,7 @@ if __name__ == "__main__":
         raise SystemExit("No URLs. Add a 'century21' list to scrape_links.json")
 
     print("PHASE 1: collecting URLs...")
-    listings = collect_urls(search_urls) or []
+    listings = await collect_urls(search_urls)
     print(f"Collected {len(listings)} unique listings")
     if not listings:
         raise SystemExit("No URLs collected — aborting Phase 2.")
@@ -272,11 +342,9 @@ if __name__ == "__main__":
 
     setup_graceful_shutdown()
     pbar = tqdm(total=len(listings), desc="Fase 2 (C21)", unit="anuncio")
-    results = extract_detail(listings) or []
+    results = await extract_details(listings)
     if pbar:
         pbar.close()
-    if not isinstance(results, list):
-        results = [results]
     results = [r for r in results if isinstance(r, dict)]
 
     os.makedirs("output", exist_ok=True)
@@ -288,3 +356,7 @@ if __name__ == "__main__":
         db.upsert("century21", results)
     except Exception as e:
         print(f"[db] upsert failed: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

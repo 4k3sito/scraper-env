@@ -27,7 +27,6 @@ skills-lock.json
 # Profile data (browser sessions)
 profiles/
 .claude/
-.claude-flow/
 graphify-out/
 error_logs/
 output/

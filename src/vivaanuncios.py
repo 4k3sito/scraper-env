@@ -1,21 +1,48 @@
 """
 Scraper robusto para vivanuncios.com.mx (inmuebles)
-Motor: Botasaurus (navegador) + Scrapling (parser)
+Motor: Crawlee (PlaywrightCrawler — driver, proxy, sesiones, reintentos y
+deteccion de bloqueo nativa) + Scrapling (parser)
 
 FASE 1: recolecta URLs paginando con /page-N/.
 FASE 2: extrae titulo, precio, codigo, direccion, caracteristicas,
         descripcion, fotos y coordenadas del HTML renderizado.
 """
-import os, json, math, re, sys, time, random, urllib.parse, urllib.request
+import asyncio
+import os, json, math, re, sys, time, urllib.parse, urllib.request
+from datetime import timedelta
+from functools import lru_cache
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
+from crawlee import Request
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.proxy_configuration import ProxyConfiguration
+from crawlee.storage_clients import MemoryStorageClient
 from scrapling.parser import Selector
-from botasaurus.browser import browser, Driver
 from dotenv import load_dotenv
 from src.utils import atomic_write_json, setup_graceful_shutdown, Checkpoint, setup_log
 from src.parser import parse_description, merge_parsed
+from src.proxy import ApifyProxyConfig
+
+# ponytail: datacenter para paginar (barato), residencial para el detalle
+# (donde el sitio bloquea mas fuerte). Lazy: solo exige APIFY_PROXY_PASSWORD
+# al correr de verdad, no al importar el modulo.
+@lru_cache(maxsize=None)
+def _proxy(groups):
+    # "auto" -> grupo datacenter dedicado, con password propia (grupo comprado
+    # aparte, no cubierto por APIFY_PROXY_PASSWORD general).
+    if groups == "auto":
+        return ApifyProxyConfig(groups="BUYPROXIES94952", password_env="APIFY_PROXY_PASSWORD_DATACENTER", country=None)
+    return ApifyProxyConfig(groups=groups)
+
+
+async def _dc_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("auto").url(session=session_id or ApifyProxyConfig.new_session_id())
+
+
+async def _res_proxy_url(session_id=None, request=None, proxy_tier=None):
+    return _proxy("RESIDENTIAL").url(session=session_id or ApifyProxyConfig.new_session_id())
+
 
 load_dotenv()
 
@@ -23,6 +50,7 @@ BASE = "https://www.vivanuncios.com.mx"
 PER_PAGE = 30
 OUTPUT_FILE = "output/vivanuncios.json"
 MAX_PAGES = 50
+EMPTY_STREAK_LIMIT = 10
 
 _cp_checkpoint = None
 pbar = None
@@ -303,42 +331,38 @@ def extract_photos(html):
 
 
 # ==========================================================================
-# FASE 1 — Botasaurus
+# FASE 1 — Crawlee
 # ==========================================================================
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def collect_ad_urls(driver: Driver, data):
-    """data = {"search_url": str, "max_pages": int|None}"""
-    search_url = data["search_url"]
-    max_pages = data.get("max_pages")
+async def collect_ad_urls(search_url: str, max_pages: int | None = None) -> list[str]:
     collected, seen = [], set()
-    total_pages = None
-    empty_streak = 0
+    state = {"total_pages": None, "empty_streak": 0}
     cap = min(max_pages or MAX_PAGES, MAX_PAGES)
+    page_iter = tqdm(total=cap, desc="  Collecting pages", unit="pg", leave=False)
 
-    page_iter = tqdm(range(1, cap + 1), desc=f"  Collecting pages", unit="pg", leave=False)
-    for page_num in page_iter:
-        if total_pages and page_num > total_pages:
-            break
-        url = build_page_url(search_url, page_num)
-        try:
-            driver.google_get(url, bypass_cloudflare=True)
-            time.sleep(random.uniform(2, 4))
-            driver.scroll_to_bottom(smooth_scroll=True)
-            time.sleep(random.uniform(0.5, 1.0))
-            driver.run_js("window.scrollTo(0, 0);")
-            time.sleep(random.uniform(0.3, 0.7))
-        except Exception as e:
-            print(f"[Fase 1] page {page_num}: {e} -> stop")
-            break
+    # Residencial en las dos fases: verificado que este sitio devuelve 403
+    # (bloqueo) con el proxy datacenter incluso para la busqueda (Fase 1),
+    # mismo patron que Century21 e Inmuebles24.
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=45),
+    )
 
-        html = driver.page_html
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        page_num = context.request.user_data["page_num"]
+        await context.block_requests()
+        await context.page.wait_for_timeout(2500)  # deja asentar JSON-LD + listado
+        html = await context.page.content()
 
-        if total_pages is None:
+        if state["total_pages"] is None:
             total = total_results(html)
             if total:
-                total_pages = max(1, math.ceil(total / PER_PAGE))
-                page_iter.set_description(f"  {total} anuncios, {total_pages} pgs")
+                state["total_pages"] = max(1, math.ceil(total / PER_PAGE))
+                context.log.info("%d anuncios, %d paginas", total, state["total_pages"])
 
         new = 0
         for u in ads_from_results(html):
@@ -348,47 +372,69 @@ def collect_ad_urls(driver: Driver, data):
                 seen.add(key)
                 collected.append(u)
                 new += 1
+        page_iter.update(1)
         page_iter.set_description(f"  Page {page_num}: +{new} (acum {len(collected)})")
         page_iter.set_postfix(total=len(collected))
+        context.log.info("page %d: +%d (acum %d)", page_num, new, len(collected))
 
         if new == 0:
-            empty_streak += 1
-            if empty_streak >= 10:
-                print(f"[Fase 1] page {page_num}: 10 consecutive empty pages -> stopping early")
-                break
+            state["empty_streak"] += 1
+            if state["empty_streak"] >= EMPTY_STREAK_LIMIT:
+                context.log.info("page %d: %d paginas vacias seguidas -> stop", page_num, EMPTY_STREAK_LIMIT)
+                return
         else:
-            empty_streak = 0
-        time.sleep(random.uniform(1.0, 2.0))
+            state["empty_streak"] = 0
 
+        next_num = page_num + 1
+        if next_num <= cap and (state["total_pages"] is None or next_num <= state["total_pages"]):
+            next_url = build_page_url(search_url, next_num)
+            await context.add_requests([
+                Request.from_url(next_url, user_data={"page_num": next_num}, unique_key=f"p{next_num}")
+            ])
+
+    first_url = build_page_url(search_url, 1)
+    await crawler.run([Request.from_url(first_url, user_data={"page_num": 1}, unique_key="p1")])
+    page_iter.close()
     return collected
 
 
 # ==========================================================================
-# FASE 2 — Botasaurus (itera la lista)
+# FASE 2 — Crawlee (una URL por request)
 # ==========================================================================
-@browser(headless=True, block_images=True, reuse_driver=True,
-         max_retry=3, close_on_crash=True, output=None)
-def extract_one(driver: Driver, url: str):
-    global pbar
-    for attempt in range(1, 4):
-        try:
-            driver.get(url)
-            time.sleep(random.uniform(2, 4))
-            html = driver.page_html
-            article_text = extract_article_text(html)
-            rec = parse_detail(url, article_text, html)
-            _cp_checkpoint.done(url)
-            if pbar:
-                pbar.update(1)
-            return rec
-        except Exception as e:
-            if attempt < 3:
-                delay = 3 * attempt
-                print(f"   [retry] {url} — attempt {attempt}/3: {e}, waiting {delay}s")
-                time.sleep(delay)
-    if pbar:
-        pbar.update(1)
-    return {"url": url, "error": "failed after 3 retries"}
+async def extract_one(urls: list[str]) -> list[dict]:
+    results = []
+
+    proxy_config = ProxyConfiguration(new_url_function=_res_proxy_url)
+    crawler = PlaywrightCrawler(
+        proxy_configuration=proxy_config,
+        storage_client=MemoryStorageClient(),
+        headless=True,
+        max_request_retries=3,
+        request_handler_timeout=timedelta(seconds=30),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context: PlaywrightCrawlingContext):
+        await context.block_requests()
+        await context.page.wait_for_timeout(2500)  # deja asentar el articulo
+        html = await context.page.content()
+        article_text = extract_article_text(html)
+        rec = parse_detail(context.request.url, article_text, html)
+        if _cp_checkpoint:
+            _cp_checkpoint.done(context.request.url)
+        results.append(rec)
+        if pbar:
+            pbar.update(1)
+
+    async def failed_handler(context: PlaywrightCrawlingContext, error: Exception):
+        results.append({"url": context.request.url, "error": str(error)})
+        if pbar:
+            pbar.update(1)
+
+    crawler.failed_request_handler(failed_handler)
+
+    await crawler.run([Request.from_url(u) for u in urls])
+    return results
 
 
 def geocode_missing(records):
@@ -408,12 +454,12 @@ def geocode_missing(records):
 # ==========================================================================
 # ORQUESTADOR
 # ==========================================================================
-def scrape(search_urls, max_pages=None, max_ads=None):
+async def scrape(search_urls, max_pages=None, max_ads=None):
     global _cp_checkpoint
     all_urls = []
     for url in search_urls:
         print(f"\n[Fase 1] Procesando URL: {url}")
-        all_urls.extend(collect_ad_urls({"search_url": url, "max_pages": max_pages}))
+        all_urls.extend(await collect_ad_urls(url, max_pages=max_pages))
 
     unique_urls = list(dict.fromkeys(all_urls))
     print(f"\n[Fase 1] {len(all_urls)} anuncios, {len(unique_urls)} únicos.\n")
@@ -437,11 +483,9 @@ def scrape(search_urls, max_pages=None, max_ads=None):
     setup_graceful_shutdown()
     global pbar
     pbar = tqdm(total=len(pending), desc="Fase 2 (Vivanuncios)", unit="anuncio")
-    results = extract_one(pending) or []
+    results = await extract_one(pending)
     if pbar:
         pbar.close()
-    if not isinstance(results, list):
-        results = [results]
     results = [r for r in results if isinstance(r, dict)]
 
     geocode_missing(results)
@@ -458,18 +502,12 @@ def scrape(search_urls, max_pages=None, max_ads=None):
     return results
 
 
-def selftest(url=None):
+async def selftest(url=None):
     if url is None:
         raise SystemExit("Pasa una URL:  python -m src.vivaanuncios --selftest <URL>")
 
-    @browser(headless=True, block_images=True, output=None)
-    def _one(driver: Driver, u):
-        driver.get(u)
-        time.sleep(3)
-        html = driver.page_html
-        return parse_detail(u, extract_article_text(html), html)
-
-    result = _one(url)
+    results = await extract_one([url])
+    result = results[0] if results else {}
     geocode_missing([result])
     lat, lon = result.get("lat"), result.get("lon")
     ok = valid_mx(lat, lon)
@@ -485,12 +523,12 @@ def selftest(url=None):
     return ok
 
 
-if __name__ == "__main__":
+async def main():
     if "--selftest" in sys.argv:
         idx = sys.argv.index("--selftest")
         _url = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
-        selftest(_url)
-        raise SystemExit(0)
+        await selftest(_url)
+        return
 
     try:
         with open("scrape_links.json", encoding="utf-8") as f:
@@ -502,11 +540,15 @@ if __name__ == "__main__":
 
     if not search_urls:
         print("No hay URLs. Agrega enlaces a 'vivaanuncios' en scrape_links.json.")
-        raise SystemExit(0)
+        return
 
     if "--sample" in sys.argv:
         i = sys.argv.index("--sample")
         n = int(sys.argv[i + 1]) if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit() else 5
-        scrape(search_urls, max_pages=1, max_ads=n)
+        await scrape(search_urls, max_pages=1, max_ads=n)
     else:
-        scrape(search_urls, max_pages=None, max_ads=None)
+        await scrape(search_urls, max_pages=None, max_ads=None)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
