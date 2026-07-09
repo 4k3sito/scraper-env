@@ -246,16 +246,17 @@ def parse_detail(html: str) -> dict:
                 description = _text(sib)
             break
 
-    # Characteristics: de-duplicated items in .facilities__options
-    facil = _first(page, ".facilities__options")
+    # Characteristics: de-duplicated items in .facilities__options. The text
+    # lives 2 levels below .facilities__item (<div><span>text</span></div>),
+    # so this needs get_all_text() (recursive) — .text only reads a node's
+    # own direct text and comes back empty on the wrapper elements.
     characteristics = []
-    if facil is not None:
-        seen_c = set()
-        for child in facil.children:
-            t = _text(child)
-            if t and t not in seen_c:
-                seen_c.add(t)
-                characteristics.append(t)
+    seen_c = set()
+    for item in page.css(".facilities__options .facilities__item"):
+        t = _clean(item.get_all_text())
+        if t and t not in seen_c:
+            seen_c.add(t)
+            characteristics.append(t)
 
     # Photos: full carousel from the gallery slides (NOT generic <img>, NOT
     # similar-snippets). Dedup by the decoded underlying image, not the URL,
@@ -307,6 +308,11 @@ async def extract_details(listings: list[dict]) -> list[dict]:
     async def handler(context: PlaywrightCrawlingContext):
         await context.block_requests()
         await context.page.wait_for_selector("h1", timeout=15000)
+        # h1 is above the fold and resolves before the page (streamed SSR)
+        # finishes rendering lower blocks like .description/.facilities —
+        # networkidle avoids reading page.content() mid-stream (same fix as
+        # century21.py's detail handler).
+        await context.page.wait_for_load_state("networkidle", timeout=15000)
         html = await context.page.content()
         d = parse_detail(html)
         ud = context.request.user_data
