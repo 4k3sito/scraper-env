@@ -8,7 +8,7 @@ from datetime import timedelta
 from urllib.parse import urljoin
 
 from tqdm import tqdm
-from crawlee import Request
+from crawlee import ConcurrencySettings, Request
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from crawlee.proxy_configuration import ProxyConfiguration
 from crawlee.storage_clients import MemoryStorageClient
@@ -295,6 +295,11 @@ async def extract_details(listings: list[dict]) -> list[dict]:
     """Entra a cada listing {id, url, lat, lng} y devuelve records extraidos."""
     results = []
 
+    # URLs ya conocidas de Fase 1 -> 100% paralelizable, pero el ramp-up por
+    # defecto de Crawlee no tiene techo: en una corrida de 823 llego a 100
+    # tabs concurrentes en esta maquina y la mayoria de los timeouts (25% de
+    # las requests) fueron por contencion de recursos, no bloqueo del sitio.
+    # Mismo cap que pincali.py.
     proxy_config = ProxyConfiguration(tiered_proxy_urls=[res_tier()])
     crawler = PlaywrightCrawler(
         proxy_configuration=proxy_config,
@@ -302,6 +307,7 @@ async def extract_details(listings: list[dict]) -> list[dict]:
         headless=True,
         max_request_retries=3,
         request_handler_timeout=timedelta(seconds=30),
+        concurrency_settings=ConcurrencySettings(min_concurrency=5, desired_concurrency=10, max_concurrency=20),
     )
 
     @crawler.router.default_handler
