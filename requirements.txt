@@ -1,0 +1,6 @@
+curl_cffi>=0.15        # Chrome-TLS impersonation — httpx gets 403 from Lamudi's gate
+selectolax>=0.3        # fast HTML parsing at all-Mexico scale
+tqdm>=4.66             # progress/completeness bars; TTY-aware, no transitive deps
+patchright>=1.52       # pincali only: headful Chrome mints the AWS WAF token
+                       # (headless never solves the challenge — needs xvfb-run)
+psycopg[binary]>=3.2   # propdb.py: carga y búsqueda sobre PostGIS
