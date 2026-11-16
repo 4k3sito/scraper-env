@@ -5,9 +5,16 @@
         "source": "github",
         "repo": "google/elephant-goldfish-model"
       }
+    },
+    "chisle": {
+      "source": {
+        "source": "github",
+        "repo": "JayPokale/Chisle"
+      }
     }
   },
   "enabledPlugins": {
-    "egm@egm": true
+    "egm@egm": true,
+    "chisle@chisle": true
   }
 }
