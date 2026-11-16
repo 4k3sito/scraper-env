@@ -54,3 +54,18 @@ Use `.venv/`, not `env/` (stale, missing deps).
 
 Make sure your use of each site and any proxy service is authorized and complies
 with applicable terms, robots directives, and local law.
+
+## iPhone 17 scout (`iphone_scout.py`)
+
+Fuera del tema inmobiliario: busca la familia iPhone 17 en Mercado Libre, calcula
+la **mediana de reventa** (usado + reacondicionado) por modelo y capacidad, y
+lista los anuncios que están ≥15 % por debajo, separando como *sospechosos* los
+que están a menos del 55 % (fraude, iCloud, piezas).
+
+```bash
+.venv/bin/python iphone_scout.py --selfcheck
+.venv/bin/python iphone_scout.py                       # buscar + reporte + CSV en data/
+.venv/bin/python iphone_scout.py --model "17 pro" --below 0.20
+.venv/bin/python iphone_scout.py --watch 1800          # cada 30 min, solo avisa lo nuevo
+.venv/bin/python iphone_scout.py --from-html pag1.html pag2.html   # si ML pide login
+```
